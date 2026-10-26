@@ -581,7 +581,6 @@ jobs:
       # made a lost Telegram packet fail a run before #2351.
       - name: Upload build artifacts
         id: upload
-        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
