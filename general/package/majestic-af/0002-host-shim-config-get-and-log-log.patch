@@ -1,0 +1,164 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 25ee2a3..ee05416 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -31,7 +31,9 @@ add_library(majestic-af SHARED
+     src/act_ms41908.c
+     src/ms41908_calc.c
+     src/act_gpiostep.c
+-    src/gpiostep_calc.c)
++    src/gpiostep_calc.c
++    # weak config_get_*/log_log for cores that do not export the plugin API
++    src/host_shim.c)
+ 
+ target_include_directories(majestic-af PRIVATE include)
+ 
+diff --git a/src/host_shim.c b/src/host_shim.c
+new file mode 100644
+index 0000000..c047647
+--- /dev/null
++++ b/src/host_shim.c
+@@ -0,0 +1,143 @@
++/* Host API the plugin imports from the core (config_get_*, log_log), provided
++ * as weak definitions for cores built without plugin-symbol export: musl does
++ * not honour weak undefined symbols at dlopen, so without these the plugin
++ * fails to load. A core that does export them still wins (it is searched
++ * first). Config is read straight from /etc/majestic.yaml. */
++
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <syslog.h>
++#include <time.h>
++
++#define SHIM __attribute__((weak, visibility("default")))
++
++#define CFG_PATH "/etc/majestic.yaml"
++#define CFG_MAX 8192
++#define CFG_REFRESH_S 2
++#define VAL_SLOTS 8
++#define VAL_LEN 160
++
++static char cfg[CFG_MAX];
++static long long cfg_loaded_at = -1000000;
++static char vals[VAL_SLOTS][VAL_LEN];
++static unsigned val_next;
++static volatile int lock;
++
++static void acquire(void) {
++    while (__atomic_exchange_n(&lock, 1, __ATOMIC_ACQUIRE))
++        ;
++}
++static void release(void) { __atomic_store_n(&lock, 0, __ATOMIC_RELEASE); }
++
++static long long now_s(void) {
++    struct timespec ts = {0, 0};
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec;
++}
++
++static void refresh(void) {
++    long long t = now_s();
++    if (t - cfg_loaded_at < CFG_REFRESH_S)
++        return;
++    cfg_loaded_at = t;
++    FILE *f = fopen(CFG_PATH, "r");
++    if (!f)
++        return;
++    size_t n = fread(cfg, 1, CFG_MAX - 1, f);
++    fclose(f);
++    cfg[n] = 0;
++}
++
++/* Value of "  key: value" inside the top-level "section:" block, or 0. */
++static const char *lookup(const char *section, const char *key, char *out) {
++    size_t slen = strlen(section), klen = strlen(key);
++    int in_sec = 0;
++    const char *p = cfg;
++    while (*p) {
++        const char *eol = strchr(p, '\n');
++        size_t len = eol ? (size_t)(eol - p) : strlen(p);
++        if (len && p[0] != ' ' && p[0] != '#' && p[0] != '\t') {
++            in_sec = len > slen && !strncmp(p, section, slen) && p[slen] == ':';
++        } else if (in_sec && len > 2 + klen && p[0] == ' ' && p[1] == ' ' &&
++                   p[2] != ' ' && !strncmp(p + 2, key, klen) &&
++                   p[2 + klen] == ':') {
++            const char *v = p + 3 + klen;
++            const char *end = p + len;
++            while (v < end && (*v == ' ' || *v == '\t'))
++                v++;
++            while (end > v && (end[-1] == ' ' || end[-1] == '\t' ||
++                               end[-1] == '\r'))
++                end--;
++            if (end - v >= 2 && (*v == '"' || *v == '\'') && end[-1] == *v) {
++                v++;
++                end--;
++            }
++            size_t vl = (size_t)(end - v);
++            if (vl >= VAL_LEN)
++                vl = VAL_LEN - 1;
++            for (size_t i = 0; i < vl; i++)
++                out[i] = v[i];
++            out[vl] = 0;
++            return out;
++        }
++        if (!eol)
++            break;
++        p = eol + 1;
++    }
++    return 0;
++}
++
++SHIM const char *config_get_string(const char *path, const char *param_name) {
++    const char *r = 0;
++    acquire();
++    refresh();
++    char *slot = vals[val_next++ % VAL_SLOTS];
++    r = lookup(path, param_name, slot);
++    release();
++    return r;
++}
++
++SHIM int config_get_int(const char *path, const char *param_name) {
++    char tmp[VAL_LEN];
++    acquire();
++    refresh();
++    const char *v = lookup(path, param_name, tmp);
++    release();
++    return v ? (int)strtol(v, 0, 0) : 0;
++}
++
++SHIM bool config_get_boolean(const char *path, const char *param_name) {
++    char tmp[VAL_LEN];
++    acquire();
++    refresh();
++    const char *v = lookup(path, param_name, tmp);
++    release();
++    if (!v)
++        return 0;
++    return !strcmp(v, "true") || !strcmp(v, "yes") || !strcmp(v, "on") ||
++           !strcmp(v, "1");
++}
++
++/* enum LogType: [TRACE,] VERBOSE, DEBUG, INFO, WARN, ERROR, FATAL */
++SHIM void log_log(int level, const char *file, int line, const char *func,
++                  const char *fmt, ...) {
++#ifdef NDEBUG
++    static const unsigned char prio[] = {7, 7, 6, 4, 3, 2};
++#else
++    static const unsigned char prio[] = {7, 7, 7, 6, 4, 3, 2};
++#endif
++    char buf[384];
++    int n = snprintf(buf, sizeof buf, "[%s:%d %s] ", file ? file : "?", line,
++                     func ? func : "?");
++    if (n < 0 || n >= (int)sizeof buf)
++        n = 0;
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(buf + n, sizeof buf - (size_t)n, fmt, ap);
++    va_end(ap);
++    syslog(LOG_USER | (level >= 0 && level < (int)sizeof prio ? prio[level] : 6),
++           "majestic-af: %s", buf);
++}
