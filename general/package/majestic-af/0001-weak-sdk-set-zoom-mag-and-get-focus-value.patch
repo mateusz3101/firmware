@@ -1,49 +1,19 @@
 diff --git a/src/engine.c b/src/engine.c
-index c3baa00..4b80a76 100644
+index c3baa00..07276d5 100644
 --- a/src/engine.c
 +++ b/src/engine.c
-@@ -38,6 +38,8 @@
- // way up — where the core is older the pointer is null and af_zoom_restore()
+@@ -39,6 +39,14 @@
  // falls back to sdk_set_zoom_mag(), which is exactly today's behaviour.
  #pragma weak sdk_set_zoom_mag_restored
-+#pragma weak sdk_set_zoom_mag
-+#pragma weak sdk_get_focus_value
  
++/* Fallback definitions for symbols that newer majestic cores export but older
++   ones do not. musl ld.so does not honor weak undefined symbols at dlopen, so
++   we provide weak defs here that get overridden by the core when present. */
++#include <stdbool.h>
++__attribute__((weak)) void sdk_set_zoom_mag(float m) { (void)m; }
++__attribute__((weak)) bool sdk_get_focus_value(unsigned *fv) { (void)fv; return false; }
++
++
  #include <majestic/af.h>
  #include <majestic/af2.h>
-@@ -469,7 +471,7 @@ static void af_zoom_restore(void) {
-     if (sdk_set_zoom_mag_restored) {
-         sdk_set_zoom_mag_restored(v);
-     } else {
--        sdk_set_zoom_mag(v);
-+        if (sdk_set_zoom_mag) sdk_set_zoom_mag(v);
-     }
-     log_i("autofocus: zoom position restored as x%.1f", (double)v);
- }
-@@ -484,7 +486,7 @@ static void af_zoom_set(float v) {
-     // OSD "%@" token and /zoom (GET) — which read from the core — reflect the
-     // magnification this plugin's reader parsed. The local cache above is what
-     // this plugin's own passes read through af_zoom_mag().
--    sdk_set_zoom_mag(v);
-+    if (sdk_set_zoom_mag) sdk_set_zoom_mag(v);
- }
- 
- // A backend that commands the zoom motor itself (act_ms41908) has no UART report
-@@ -642,7 +644,7 @@ void af_engine_ensure(void) {
- static bool fv_sample(unsigned *fv) {
-     unsigned v, sum = 0, n = 0;
-     for (int i = 0; i < 2; i++) {
--        if (sdk_get_focus_value(&v)) {
-+        if (sdk_get_focus_value && sdk_get_focus_value(&v)) {
-             sum += v;
-             n++;
-         }
-@@ -673,7 +675,7 @@ static unsigned af_io_fv(void *ctx) {
-     // which rejects transient bright frames far better than averaging two here would.
-     (void)ctx;
-     unsigned v;
--    return sdk_get_focus_value(&v) ? v : 0;
-+    return (sdk_get_focus_value && sdk_get_focus_value(&v)) ? v : 0;
- }
- static long af_io_now(void *ctx) {
-     (void)ctx;
+ #include <majestic/af3.h>
