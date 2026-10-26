@@ -1,0 +1,117 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ee05416..61256e6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -47,7 +47,16 @@ target_compile_definitions(majestic-af PRIVATE FILE_BASENAME="majestic-af")
+ target_compile_options(majestic-af PRIVATE -Os -Wall -Wextra)
+ 
+ include(GNUInstallDirs)
+-install(TARGETS majestic-af LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
++
++# LD_PRELOAD shim for the majestic executable (not part of the plugin): clamps a
++# PTZ <Timeout> above the core's 120 s limit, which the VIGI NVR always exceeds.
++add_library(majestic-onvif-compat SHARED src/onvif_compat.c)
++target_compile_options(majestic-onvif-compat PRIVATE -Os -Wall -Wextra)
++set_target_properties(majestic-onvif-compat PROPERTIES
++    PREFIX ""
++    POSITION_INDEPENDENT_CODE ON)
++
++install(TARGETS majestic-af majestic-onvif-compat LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+ 
+ # Offline model test — the af2 search's regression guard. It drives src/af2.c
+ # against a synthetic parfocal lens on a virtual clock, so it runs in
+diff --git a/src/onvif_compat.c b/src/onvif_compat.c
+new file mode 100644
+index 0000000..3fe9928
+--- /dev/null
++++ b/src/onvif_compat.c
+@@ -0,0 +1,89 @@
++/* LD_PRELOAD shim for the majestic executable: ONVIF compatibility.
++ *
++ * The core rejects a PTZ <Timeout> above its advertised PTZTimeout maximum
++ * (PT120S) with ter:InvalidTimeout, but the TP-Link VIGI NVR always asks for
++ * PT600S, so none of its pan/tilt commands ever start. Clamp such values to
++ * PT120S in the incoming request, in place and keeping its length (PT600S ->
++ * PT120S; longer values are zero-padded), so Content-Length stays valid. */
++
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#define MAX_S 120
++#define SCAN_MAX 16384
++
++static void clamp_timeouts(unsigned char *b, long n) {
++    static const char tag[] = "Timeout>PT";
++    const long tl = sizeof tag - 1;
++    for (long i = 0; i + tl < n; i++) {
++        long k = 0;
++        while (k < tl && b[i + k] == (unsigned char)tag[k]) {
++            k++;
++        }
++        if (k < tl) {
++            continue;
++        }
++        long d = i + tl, e = d;
++        unsigned long v = 0;
++        while (e < n && b[e] >= '0' && b[e] <= '9' && e - d < 9) {
++            v = v * 10 + (unsigned long)(b[e++] - '0');
++        }
++        if (e - d < 3 || e >= n || b[e] != 'S' || v <= MAX_S) {
++            continue;
++        }
++        unsigned long m = MAX_S;
++        for (long j = e - 1; j >= d; j--) {
++            b[j] = (unsigned char)('0' + m % 10);
++            m /= 10;
++        }
++        i = e;
++    }
++}
++
++static void fix(void *buf, ssize_t r) {
++    if (r > 20 && r <= SCAN_MAX) {
++        clamp_timeouts(buf, r);
++    }
++}
++
++ssize_t read(int fd, void *buf, size_t n) {
++    static ssize_t (*real)(int, void *, size_t);
++    if (!real) {
++        real = (ssize_t(*)(int, void *, size_t))dlsym(RTLD_NEXT, "read");
++    }
++    ssize_t r = real(fd, buf, n);
++    if (r > 0 && fd > 2) {
++        fix(buf, r);
++    }
++    return r;
++}
++
++ssize_t recv(int fd, void *buf, size_t n, int flags) {
++    static ssize_t (*real)(int, void *, size_t, int);
++    if (!real) {
++        real = (ssize_t(*)(int, void *, size_t, int))dlsym(RTLD_NEXT, "recv");
++    }
++    ssize_t r = real(fd, buf, n, flags);
++    if (r > 0) {
++        fix(buf, r);
++    }
++    return r;
++}
++
++ssize_t recvfrom(int fd, void *restrict buf, size_t n, int flags,
++                 struct sockaddr *restrict sa, socklen_t *restrict sl) {
++    static ssize_t (*real)(int, void *, size_t, int, struct sockaddr *,
++                           socklen_t *);
++    if (!real) {
++        real = (ssize_t(*)(int, void *, size_t, int, struct sockaddr *,
++                           socklen_t *))dlsym(RTLD_NEXT, "recvfrom");
++    }
++    ssize_t r = real(fd, buf, n, flags, sa, sl);
++    if (r > 0) {
++        fix(buf, r);
++    }
++    return r;
++}

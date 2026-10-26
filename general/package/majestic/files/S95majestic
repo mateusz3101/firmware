@@ -6,6 +6,10 @@
 # musl never reads /etc/TZ itself; it uses $TZ, else /etc/localtime.
 [ -r /etc/TZ ] && export TZ=$(cat /etc/TZ)
 
+# Installed by majestic-af only: clamps the PTZ <Timeout> that NVRs send above
+# the core's 120 s limit (ONVIF ContinuousMove is otherwise rejected).
+[ -r /usr/lib/majestic-onvif-compat.so ] && export LD_PRELOAD=/usr/lib/majestic-onvif-compat.so
+
 DAEMON="majestic"
 DAEMON_PATH="/usr/bin/$DAEMON"
 DAEMON_ARGS="-s"
